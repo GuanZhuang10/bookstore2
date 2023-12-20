@@ -1,0 +1,13 @@
+{% include '/auth/header.html' %}
+{% if code==200 %}
+    What a pity! You unregistered successfully.
+{% else %}
+    Oh ho? Don't leave. Stay and wait for the police :)
+{% endif %}
+
+<p>
+    {{message}}
+</p>
+<p>
+    {{code}}
+</p>

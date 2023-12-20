@@ -1,0 +1,10 @@
+.coverage
+.idea
+.pytest_cache
+*.log
+*.db
+*.pyc
+__pycache__
+htmlcov
+__pycache__/
+.pytest/

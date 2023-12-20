@@ -1,0 +1,14 @@
+{% include '/auth/header.html' %}
+{% if code==200 %}
+    Welcome! :)
+{% else %}
+    The Wonderland is not accessible to you! :(
+{% endif %}
+
+<p>
+    {{message}}
+</p>
+<p>
+    {{code}}
+</p>
+
