@@ -1,48 +1,21 @@
-import uuid
+from datetime import datetime, timedelta
+
+import psycopg2
+import json
 import logging
-import datetime
+import uuid
 from be.model import db_conn
 from be.model import error
-from be.model.model import StoreBook, User2, NewOrder, OrderList, UserStore
-
-from apscheduler.schedulers.background import BackgroundScheduler
-
-UNPAID = -1
-PAID = 0
-DELIVERING = 1
-ARRIVED = 2
-RECEIVED = 3
-CANCELED = 4
-
-
-def cancel_order(session, order_id, store_book, stock_level):
-    ######################order_id上建索引???????????????????????
-    # 加锁????????????????????????????????????????????????????
-    session.query(NewOrder).filter(NewOrder.order_id == order_id).delete()
-    session.query(OrderList).filter(OrderList.order_id == order_id).delete()
-    store_book.stock_level = stock_level
-    session.commit()
-
-
-def check_order(session, order_id, store_book, stock_level):
-    check = session.query(NewOrder).filter(NewOrder.order_id == order_id).first()
-    if check.status == UNPAID:
-        cancel_order(session, order_id, store_book, stock_level)
-
-
-def auto_cancel(session, order_id, store_book, stock_level):
-    sched = BackgroundScheduler()
-    sched.add_job(check_order, args=[session, order_id, store_book, stock_level], id='check_order_paid', trigger='date',
-                  run_date=datetime.datetime.now()+datetime.timedelta(seconds=30))
-    sched.start()
-
 
 class Buyer(db_conn.DBConn):
     def __init__(self):
         db_conn.DBConn.__init__(self)
 
-    def new_order(self, user_id: str, store_id: str, id_and_count: [(str, int)]) -> (int, str, str):
+    def new_order(
+        self, user_id: str, store_id: str, id_and_count: [(str, int)]
+    ) -> (int, str, str):
         order_id = ""
+        cursor = None
         try:
             if not self.user_id_exist(user_id):
                 return error.error_non_exist_user_id(user_id) + (order_id,)
@@ -50,143 +23,329 @@ class Buyer(db_conn.DBConn):
                 return error.error_non_exist_store_id(store_id) + (order_id,)
             uid = "{}_{}_{}".format(user_id, store_id, str(uuid.uuid1()))
 
-            total_price = 0
             for book_id, count in id_and_count:
-                session = self.session
-                store_book = session.query(StoreBook).filter(StoreBook.store_id == store_id).filter(
-                    StoreBook.book_id == book_id).first()
-                if store_book is None:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT book_id, stock_level, book_info FROM store "
+                    "WHERE store_id = %s AND book_id = %s;",
+                    (store_id, book_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
                     return error.error_non_exist_book_id(book_id) + (order_id,)
 
-                stock_level = store_book.stock_level
-                price = store_book.price
+                stock_level = row[1]
+                book_info = row[2]
+                book_info_json = json.loads(book_info)
+                price = book_info_json.get("price")
 
                 if stock_level < count:
                     return error.error_stock_level_low(book_id) + (order_id,)
 
-                total_price = total_price + price * count
+                cursor.execute(
+                    "UPDATE store set stock_level = stock_level - %s "
+                    "WHERE store_id = %s and book_id = %s and stock_level >= %s; ",
+                    (count, store_id, book_id, count),
+                )
+                if cursor.rowcount == 0:
+                    return error.error_stock_level_low(book_id) + (order_id,)
 
-                store_book.stock_level = stock_level - count
+                cursor.execute(
+                    "INSERT INTO new_order_detail(order_id, book_id, count, price) "
+                    "VALUES(%s, %s, %s, %s);",
+                    (uid, book_id, count, price),
+                )
 
-                order_new = NewOrder(book_id=book_id, order_id=uid, count=count, status=UNPAID)
-                session.add(order_new)
-
-            create_time = datetime.datetime.now()
-            new_list = OrderList(order_id=uid, user_id=user_id, store_id=store_id, total_price=total_price,
-                                 time=create_time)  # 北京时间？？？？？？？？？？
-            session.add(new_list)
-            session.commit()
+            # cursor.execute(
+            #     "INSERT INTO new_order(order_id, store_id, user_id) "
+            #     "VALUES(%s, %s, %s);",
+            #     (uid, store_id, user_id),
+            # )
+            # self.conn.commit()
             order_id = uid
+            now_time = datetime.utcnow()
+            cursor.execute(
+                "INSERT INTO new_order(order_id, store_id, user_id, book_status, order_time) "
+                "VALUES(%s, %s, %s, 2, %s);",
+                (uid, store_id, user_id, now_time),
+            )
+            self.conn.commit()
 
-            auto_cancel(session,order_id,store_book,stock_level)
-
-        except KeyError as e:
-            logging.info("528, {}".format(str(e)))
-            return 528, "{}".format(str(e)), ""
-        except BaseException as e:
-            logging.info("530, {}".format(str(e)))
-            print("{}".format(str(e)))
-            return 530, "{}".format(str(e)), ""
-
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok", order_id
 
     def payment(self, user_id: str, password: str, order_id: str) -> (int, str):
-        session = self.session
+        cursor = None
         try:
-            order = session.query(OrderList).filter(OrderList.order_id == order_id).first()
-            if order is None:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT order_id, store_id, user_id, book_status, order_time FROM new_order WHERE order_id = %s",
+                (order_id,),
+            )
+            # cursor.execute(
+            #     "SELECT order_id, store_id, user_id FROM new_order WHERE order_id = %s",
+            #     (order_id,),
+            # )
+            row = cursor.fetchone()
+            if row is None:
                 return error.error_invalid_order_id(order_id)
-            print("----------------order get---------------")
-            order_id = order.order_id
-            print(order_id)
-            buyer_id = order.user_id
-            store_id = order.store_id
-            total_price = order.total_price
+
+            order_id = row[0]
+            buyer_id = row[2]
+            store_id = row[1]
 
             if buyer_id != user_id:
                 return error.error_authorization_fail()
 
-            print("---------------authoriztion success------------")
-
-            buyer = session.query(User2).filter(User2.user_id == buyer_id).first()
-            if buyer is None:
+            cursor.execute(
+                "SELECT balance, password FROM \"user\" WHERE user_id = %s;", (buyer_id,)
+            )
+            row = cursor.fetchone()
+            if row is None:
                 return error.error_non_exist_user_id(buyer_id)
-
-            print("---------------buyer existed------------")
-
-            balance = buyer.balance
-            if password != buyer.password:
+            balance = row[0]
+            if password != row[1]:
                 return error.error_authorization_fail()
 
-            print("---------------authoriztion success------------")
-
-            store = session.query(UserStore).filter(UserStore.store_id == store_id).first()
-            if store is None:
+            cursor.execute(
+                "SELECT store_id, user_id FROM user_store WHERE store_id = %s;",
+                (store_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
                 return error.error_non_exist_store_id(store_id)
 
-            print("---------------store exist------------")
-
-            seller_id = store.user_id
+            seller_id = row[1]
 
             if not self.user_id_exist(seller_id):
                 return error.error_non_exist_user_id(seller_id)
 
-            print("---------------seller existed------------")
+            cursor.execute(
+                "SELECT book_id, count, price FROM new_order_detail WHERE order_id = %s;",
+                (order_id,),
+            )
+            total_price = 0
+            for row in cursor:
+                count = row[1]
+                price = row[2]
+                total_price = total_price + price * count
 
             if balance < total_price:
                 return error.error_not_sufficient_funds(order_id)
-            print("-------------------money enough----------")
 
-            buyer.balance = balance - total_price
+            cursor.execute(
+                "UPDATE \"user\" SET balance = balance - %s "
+                "WHERE user_id = %s AND balance >= %s",
+                (total_price, buyer_id, total_price),
+            )
 
-            seller = session.query(User2).filter(User2.user_id == seller_id).first()
-            seller.balance = seller.balance + total_price
-            print("-----------------seller done,buy done-----------------")
+            if cursor.rowcount == 0:
+                return error.error_not_sufficient_funds(order_id)
 
-            session.commit()
+            cursor.execute(
+                "UPDATE \"user\" set balance = balance + %s "
+                "WHERE user_id = %s",
+                (total_price, buyer_id),
+            )
 
-            orders = session.query(NewOrder).filter(NewOrder.order_id == order_id).all()
-            for o in orders:
-                o.status = PAID
-                session.add(o)
-            # cursor = conn.execute("DELETE FROM new_order WHERE order_id = ?", (order_id, ))
-            # if cursor.rowcount == 0:
-            #     return error.error_invalid_order_id(order_id)
+            if cursor.rowcount == 0:
+                return error.error_non_exist_user_id(buyer_id)
 
-            # cursor = conn.execute("DELETE FROM new_order_detail where order_id = ?", (order_id, ))
-            # if cursor.rowcount == 0:
-            #     return error.error_invalid_order_id(order_id)
+            cursor.execute(
+                "DELETE FROM new_order WHERE order_id = %s", (order_id,)
+            )
+            if cursor.rowcount == 0:
+                return error.error_invalid_order_id(order_id)
 
-            print("----------------order complete-----------")
-            session.commit()
+            cursor.execute(
+                "DELETE FROM new_order_detail where order_id = %s", (order_id,)
+            )
+            if cursor.rowcount == 0:
+                return error.error_invalid_order_id(order_id)
 
+            cursor.execute(
+                "INSERT INTO new_order_paid (order_id, user_id, store_id, book_status, price) "
+                "VALUES (%s, %s, %s, 1, %s)",
+                (order_id, buyer_id, store_id, total_price),
+            )
 
+            self.conn.commit()
 
-        except KeyError as e:
-            return 528, "{}".format(str(e))
-
-        except BaseException as e:
-            return 530, "{}".format(str(e))
-
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok"
 
     def add_funds(self, user_id, password, add_value) -> (int, str):
-        session = self.session
+        cursor = None
         try:
-            user = session.query(User2).filter(User2.user_id == user_id).first()
-            if user is None:
-                return error.error_non_exist_user_id(user_id)
-
-            if user.password != password:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT password  from \"user\" where user_id=%s", (user_id,)
+            )
+            row = cursor.fetchone()
+            if row is None:
                 return error.error_authorization_fail()
 
-            user.balance = user.balance + add_value
+            if row[0] != password:
+                return error.error_authorization_fail()
 
-            session.commit()
-        except KeyError as e:
-            return 528, "{}".format(str(e))
-        except BaseException as e:
-            print("{}".format(str(e)))
-            return 530, "{}".format(str(e))
+            cursor.execute(
+                "UPDATE \"user\" SET balance = balance + %s WHERE user_id = %s",
+                (add_value, user_id),
+            )
+            if cursor.rowcount == 0:
+                return error.error_non_exist_user_id(user_id)
 
+            self.conn.commit()
+
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok"
+
+    def order_cancel(self, user_id: str, order_id: str) -> (int, str):
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT order_id, store_id, user_id, book_status, order_time FROM new_order WHERE order_id = %s",
+                (order_id,),
+            )
+            new_order_result = cursor.fetchone()
+
+            if new_order_result is not None:
+                order_id, store_id, buyer_id, book_status, order_time = new_order_result
+                if buyer_id != user_id:
+                    return error.error_authorization_fail()
+
+                cursor.execute("DELETE FROM new_order WHERE order_id = %s", (order_id,))
+            else:
+                cursor.execute(
+                    "SELECT order_id, store_id, user_id, book_status, price FROM new_order_paid WHERE order_id = %s",
+                    (order_id,)
+                )
+                new_order_paid_result = cursor.fetchone()
+                if new_order_paid_result:
+                    order_id, store_id, buyer_id, book_status, price = new_order_paid_result
+                    if buyer_id != user_id:
+                        return error.error_authorization_fail()
+
+                    cursor.execute(
+                        "UPDATE \"user\" SET balance = balance + %s WHERE user_id = %s",
+                        (price, buyer_id)
+                    )
+                    cursor.execute(
+                        "UPDATE \"user\" SET balance = balance - %s WHERE user_id = %s",
+                        (price, store_id)
+                    )
+                    cursor.execute("DELETE FROM new_order_paid WHERE order_id = %s", (order_id,))
+
+                else:
+                    return error.error_invalid_order_id(order_id)
+
+                cursor.execute(
+                    "SELECT book_id, count FROM new_order_detail WHERE order_id = %s",
+                    (order_id,)
+                )
+                orders_result = cursor.fetchall()
+                for order_result in orders_result:
+                    book_id, count = order_result
+                    cursor.execute(
+                        "UPDATE store SET stock_level = stock_level + %s WHERE store_id = %s AND book_id = %s",
+                        (count, store_id, book_id)
+                    )
+            return 200, "ok"
+        finally:
+            cursor.close()
+
+    def history_order(self, user_id: str):
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT order_id, store_id, user_id, book_status, order_time FROM new_order WHERE user_id = %s",
+                (user_id,),
+            )
+            new_orders_result = cursor.fetchall()
+            if new_orders_result:
+                for new_order_result in new_orders_result:
+                    order_id = new_order_result[0]
+                    cursor.execute(
+                        "SELECT book_id, count, price FROM new_order_detail WHERE order_id = %s",
+                        (order_id,)
+                    )
+
+                    new_order_details_result = cursor.fetchall()
+                    if new_order_details_result:
+                        return error.error_invalid_order_id(order_id)
+
+            cursor.execute(
+                "SELECT order_id, store_id, user_id, book_status, price FROM new_order_paid WHERE user_id = %s",
+                (user_id,)
+            )
+
+            new_orders_paid_row = cursor.fetchall()
+            if not new_orders_paid_row:
+                return error.error_invalid_order_id(order_id)
+            return 200, "ok"
+
+
+            if new_orders_paid_row:
+                for new_order_paid_rows in new_orders_paid_row:
+                    order_id = new_order_paid_rows[0]
+                    cursor.execute(
+                        "SELECT book_id, count, price FROM new_order_detail WHERE order_id = %s",
+                        (order_id,)
+                    )
+        except Exception as e:
+            return 500, "Internal Server Error"
+        finally:
+            cursor.close()
+
+    def order_status(self):
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            timeout_datetime = datetime.now() - timedelta(seconds=5)
+
+            cursor.execute("DELETE FROM new_order WHERE order_time <= %s", (timeout_datetime,))
+            return 200, "ok"
+        finally:
+            cursor.close()
+
+    def receive_book(self, user_id: str, order_id: str) -> (int, str):
+        cursor = None
+        try:
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM new_order_paid WHERE order_id = %s", (order_id,))
+            row = cursor.fetchone()
+
+            if row is None:
+                return error.error_invalid_order_id(order_id)
+
+            buyer_id = row["user_id"]
+            books_status = row["book_status"]
+
+            if buyer_id != user_id:
+                return error.error_authorization_fail()
+
+            if books_status == 1:
+                return error.error_book_has_not_sent()
+
+            if books_status == 2:
+                return error.error_not_paid_book()
+
+            if books_status == 3:
+                return error.error_book_has_received()
+
+            cursor.execute("UPDATE new_order_paid SET book_status = 3 WHERE order_id = %s", (order_id,))
+            self.conn.commit()
+
+            return 200, "ok"
+
+        finally:
+            if cursor:
+                cursor.close()

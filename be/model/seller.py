@@ -1,19 +1,22 @@
-from sqlalchemy.exc import SQLAlchemyError
+import psycopg2
+
 from be.model import error
 from be.model import db_conn
 
-from be.model.model import *
-
-import json
-import pymongo
-import jieba
 
 class Seller(db_conn.DBConn):
-
     def __init__(self):
         db_conn.DBConn.__init__(self)
 
-    def add_book(self, user_id: str, store_id: str, book_id: str, book_json_str: str, stock_level: int):
+    def add_book(
+        self,
+        user_id: str,
+        store_id: str,
+        book_id: str,
+        book_json_str: str,
+        stock_level: int,
+    ):
+        cursor = None
         try:
             if not self.user_id_exist(user_id):
                 return error.error_non_exist_user_id(user_id)
@@ -21,18 +24,27 @@ class Seller(db_conn.DBConn):
                 return error.error_non_exist_store_id(store_id)
             if self.book_id_exist(store_id, book_id):
                 return error.error_exist_book_id(book_id)
-            new_book = StoreBook(store_id=store_id, book_id=book_id,price = int(json.loads(book_json_str).get('price')), stock_level = stock_level)
-            self.sess.add(new_book)
-            self.sess.commit()
-
-        except SQLAlchemyError as e:
-            print("{}".format(str(e)))
+            cursor=self.conn.cursor()
+            cursor.execute(
+                "INSERT into store(store_id, book_id, book_info, stock_level)"
+                "VALUES (%s, %s, %s, %s)",
+                (store_id, book_id, book_json_str, stock_level),
+            )
+            self.conn.commit()
+        except psycopg2.Error as e:
             return 528, "{}".format(str(e))
         except BaseException as e:
             return 530, "{}".format(str(e))
+
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok"
 
-    def add_stock_level(self, user_id: str, store_id: str, book_id: str, add_stock_level: int):
+    def add_stock_level(
+        self, user_id: str, store_id: str, book_id: str, add_stock_level: int
+    ):
+        cursor = None
         try:
             if not self.user_id_exist(user_id):
                 return error.error_non_exist_user_id(user_id)
@@ -40,32 +52,73 @@ class Seller(db_conn.DBConn):
                 return error.error_non_exist_store_id(store_id)
             if not self.book_id_exist(store_id, book_id):
                 return error.error_non_exist_book_id(book_id)
-            new_book_info = self.sess.query(StoreBook).filter().first()
-            old_level = new_book_info.stock_level
-            new_book_info.stock_level = old_level+add_stock_level
-            self.sess.commit()
 
-
-        except SQLAlchemyError as e:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE store SET stock_level = stock_level + %s "
+                "WHERE store_id = %s AND book_id = %s",
+                (add_stock_level, store_id, book_id),
+            )
+            self.conn.commit()
+        except psycopg2.Error as e:
             return 528, "{}".format(str(e))
         except BaseException as e:
             return 530, "{}".format(str(e))
+
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok"
 
     def create_store(self, user_id: str, store_id: str) -> (int, str):
+        cursor = None
         try:
             if not self.user_id_exist(user_id):
                 return error.error_non_exist_user_id(user_id)
             if self.store_id_exist(store_id):
                 return error.error_exist_store_id(store_id)
 
-            new_store = UserStore(store_id=store_id,user_id=user_id)
-            self.sess.add(new_store)
-            self.sess.commit()
-
-
-        except SQLAlchemyError as e:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT into user_store(store_id, user_id)" "VALUES (%s, %s)",
+                (store_id, user_id),
+            )
+            self.conn.commit()
+        except psycopg2.Error as e:
             return 528, "{}".format(str(e))
         except BaseException as e:
             return 530, "{}".format(str(e))
+
+        finally:
+            if cursor:
+                cursor.close()
         return 200, "ok"
+
+    def ship_book(self, user_id: str, order_id: str):
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM new_order_paid WHERE order_id = %s", (order_id,))
+            row = cursor.fetchone()
+
+            if row is None:
+                return error.error_invalid_order_id(order_id)
+
+            store_id = row[1]
+            books_status = row[3]
+
+            cursor.execute("SELECT * FROM user_store WHERE store_id = %s", (store_id,))
+            seller_result = cursor.fetchone()
+            seller_id = seller_result[0]
+
+            if books_status == 0:
+                return error.error_book_has_sent()
+            if seller_id != user_id:
+                return error.error_authorization_fail()
+            cursor.execute("UPDATE new_order_paid SET book_status = 0 WHERE order_id = %s", (order_id,))
+            self.conn.commit()
+            return 200, "ok"
+
+        finally:
+            if cursor:
+                cursor.close()
